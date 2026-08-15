@@ -83,7 +83,9 @@ func runHTTP(ctx context.Context, srv *mcp.Server, client *k8s.Client, log *slog
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"version": version.String()})
 	})
-	mux.Handle("/mcp", srv.HTTPHandler())
+	// WithIdentity lifts the bot-set X-Remote-User header into the request
+	// context so identity-scoped tools can resolve the caller's ArgoCD access.
+	mux.Handle("/mcp", mcp.WithIdentity(srv.HTTPHandler()))
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 	})

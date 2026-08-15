@@ -16,6 +16,8 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/snapp-incubator/argocd-mcp/internal/access"
+	"github.com/snapp-incubator/argocd-mcp/internal/groups"
 	"github.com/snapp-incubator/argocd-mcp/internal/k8s"
 	"github.com/snapp-incubator/argocd-mcp/internal/version"
 )
@@ -44,17 +46,28 @@ type tool struct {
 type Server struct {
 	mcpServer *sdkmcp.Server
 	client    *k8s.Client
+	access    access.Resolver
 	log       *slog.Logger
 }
 
-// NewServer builds the server and registers all tools.
+// NewServer builds the server and registers all tools. The access resolver
+// (group-membership + AppProject-role matching) is built here so the identity-
+// scoped tools can answer "what can this caller access".
 func NewServer(client *k8s.Client, log *slog.Logger) *Server {
-	s := &Server{client: client, log: log}
+	gr := groups.NewOpenShift(client.Dynamic, groupCacheTTL())
+	resolver := access.NewArgoCD(gr, client.Dynamic, argocdNamespace(), rbacConfigMap())
+	return newServer(client, resolver, log)
+}
+
+// newServer wires a server around an explicit access resolver (injected by
+// tests; NewServer builds the real one).
+func newServer(client *k8s.Client, resolver access.Resolver, log *slog.Logger) *Server {
+	s := &Server{client: client, access: resolver, log: log}
 	s.mcpServer = sdkmcp.NewServer(
 		&sdkmcp.Implementation{Name: "argocd-mcp", Version: version.String()},
 		&sdkmcp.ServerOptions{Instructions: instructions},
 	)
-	for _, t := range buildTools() {
+	for _, t := range buildTools(resolver) {
 		s.addTool(t)
 	}
 	return s
