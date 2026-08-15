@@ -64,7 +64,7 @@ func (o *openshift) GroupsFor(ctx context.Context, user string) ([]string, error
 		if err != nil {
 			// Serve stale data on transient errors rather than dropping all
 			// access; only fail hard if we have never loaded successfully.
-			if o.byUser == nil || len(o.byUser) == 0 {
+			if len(o.byUser) == 0 {
 				return nil, err
 			}
 		} else {

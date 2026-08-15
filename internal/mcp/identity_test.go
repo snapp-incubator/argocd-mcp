@@ -48,7 +48,7 @@ func callMyProjects(t *testing.T, url, user string) (string, bool) {
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}
-	defer sess.Close()
+	defer func() { _ = sess.Close() }()
 
 	res, err := sess.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: "argocd_my_projects"})
 	if err != nil {
