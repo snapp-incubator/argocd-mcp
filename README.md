@@ -5,15 +5,14 @@ that exposes ArgoCD **Applications** and **AppProjects** to an AI agent —
 sync/health, sources, per-resource status, and per-user access.
 
 It is built for a **multi-tenant** ArgoCD (many teams, one `user-argocd`
-namespace) driven by the SnappCloud bot. It offers two families of tools:
-
-- **Namespace-scoped** tools take a `namespace` argument (the team's own /
-  destination namespace) and return objects keyed by that namespace, so the
-  bot's existing namespace authorization scopes them per team.
-- **Identity-scoped** tools answer "what can *I* access" from the caller's
-  identity — they resolve the caller's OpenShift **groups** and match them
-  against **AppProject roles** (exactly how ArgoCD authorizes), returning each
-  accessible project with the caller's capability (admin / sync / view).
+namespace) driven by the SnappCloud bot. **Every tool is identity-scoped**: it
+answers "what can *I* access" from the caller's identity — resolving the caller's
+OpenShift **groups** and matching them against **AppProject roles** (exactly how
+ArgoCD authorizes), returning each accessible project/application with the
+caller's capability (admin / sync / view). `namespace`, `project`, and `name`
+arguments are only optional **filters/selectors**, validated against that access
+— never the authorization mechanism, so the model can never reach another team's
+data.
 
 `argocd-mcp` holds **no ArgoCD credentials** and never calls the ArgoCD API — it
 reads the `argoproj.io` CRs from the Kubernetes API with a read-only
@@ -21,25 +20,19 @@ ServiceAccount.
 
 ## Tools
 
-Namespace-scoped (arg `namespace` = the team / destination namespace, never
-`user-argocd`):
+All tools are strictly read-only (`get`/`list` only) and scoped to the **caller**
+(see *Identity & authorization* below). A `namespace` is a **destination**
+namespace (the team's own namespace, `spec.destination.namespace`), never
+`user-argocd`.
 
-| Tool | Purpose |
-|---|---|
-| `argocd_list_applications` | Applications deploying into a namespace: project, sync, health, source. |
-| `argocd_get_application` | One Application in depth: conditions, last sync operation, per-resource sync/health. |
-| `argocd_get_appproject` | The AppProject governing a namespace: source repos, destinations, roles. |
-
-Identity-scoped (no namespace arg; scoped to the **caller**, see *Identity* below):
-
-| Tool | Purpose |
-|---|---|
-| `argocd_my_projects` | Every project the caller can access, each with capability (admin/sync/view) + namespaces. |
-| `argocd_my_applications` | Every Application across the caller's projects, with sync/health + capability. |
-| `argocd_my_namespaces` | Destination namespaces the caller's projects deploy into. |
-| `argocd_can_i` | Whether the caller may perform an action (`sync`, `get`, `delete`, `action/apps/Deployment/restart`, …) on an application. |
-
-All tools are strictly read-only (`get`/`list` only).
+| Tool | Args | Purpose |
+| --- | --- | --- |
+| `argocd_list_applications` | `namespace?`, `project?` | The caller's Applications (project, sync, health, source, capability); optional filters. |
+| `argocd_get_application` | `name`, `namespace?` | One Application in depth: conditions, last sync operation, per-resource sync/health. `namespace` disambiguates same-named apps. |
+| `argocd_list_projects` | `namespace?` | The caller's projects as summaries: capability, namespaces, role names. `namespace` narrows to projects governing it. |
+| `argocd_get_project` | `name?`, `namespace?` | Full project detail: source repos, destinations, roles. By `name` (one) **or** `namespace` (every project governing it — may be several). |
+| `argocd_list_namespaces` | `project?` | Destination namespaces the caller's projects deploy into; optional `project` narrows. |
+| `argocd_can_i` | `application`, `action` | Whether the caller may perform an action (`sync`, `get`, `delete`, `action/apps/Deployment/restart`, …) on an application. |
 
 ## Identity & authorization
 
@@ -82,7 +75,7 @@ kubeconfig. Endpoints: `/mcp`, `/healthz`, `/readyz`, `/version`.
 ### Configuration (env)
 
 | Var | Default | Meaning |
-|---|---|---|
+| --- | --- | --- |
 | `ARGOCD_NAMESPACE` | `user-argocd` | Namespace holding AppProjects + the RBAC ConfigMap. |
 | `ARGOCD_RBAC_CONFIGMAP` | `argocd-rbac-cm` | ConfigMap with the global admin/readonly grants. |
 | `GROUP_CACHE_TTL` | `1m` | How long the user→groups map is cached. |

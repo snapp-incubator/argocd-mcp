@@ -1,9 +1,11 @@
 // Package mcp implements the read-only ArgoCD MCP server. Its tools read the
 // argoproj.io Application and AppProject custom resources from the Kubernetes
-// API (never the ArgoCD API) and summarize them for an AI agent. Every record
-// is keyed by the object's DESTINATION namespace — the tenant's own namespace —
-// and never by the shared argocd namespace, so a namespace-scoped caller (the
-// SnappCloud bot) can filter results per team. Nothing here mutates state.
+// API (never the ArgoCD API) and summarize them for an AI agent. Every tool is
+// identity-scoped: it authorizes from the caller's X-Remote-User identity
+// (resolved to OpenShift groups matched against AppProject roles) and answers
+// "what can *I* access", so a caller only ever sees their own tenants' objects.
+// Any namespace/project/name argument is only an optional filter. Nothing here
+// mutates state.
 package mcp
 
 import (
@@ -138,26 +140,31 @@ const instructions = `You are a read-only ArgoCD assistant. Every tool reads Arg
 AppProjects and reports sync/health, sources, and per-resource status. You never
 change anything — you explain state and recommend actions the user can take.
 
-Scope: every tool takes a "namespace" argument that is the TEAM / DESTINATION
-namespace — the namespace an Application deploys into (spec.destination.namespace),
-which for a team equals its own namespace and its AppProject name. It is NOT the
-shared "user-argocd" namespace where the CRs live. Always pass the user's own
-namespace.
+Scope: every tool answers "what can *I* access". Access is the CALLER's own,
+resolved from their authenticated identity (their OpenShift groups matched
+against AppProject roles) — you never pass or choose an identity. namespace,
+project and name arguments are only optional FILTERS/selectors; they never widen
+access. A "namespace" is a DESTINATION namespace (spec.destination.namespace, the
+team's own namespace), NOT the shared "user-argocd" namespace where the CRs live.
 
 Workflows:
-1. "What are my ArgoCD apps / are they healthy?": argocd_list_applications
-   (namespace=<team ns>) → each app's sync (Synced/OutOfSync) and health
-   (Healthy/Degraded/Progressing/Missing).
-2. "Why is <app> unhealthy / out of sync?": argocd_get_application
-   (namespace=<team ns>, name=<app>) → conditions, last operation, and the
-   per-resource sync/health list; a Degraded resource or a failed sync operation
-   is the lead.
-3. "Who can access my project / where can it deploy from?": argocd_get_appproject
-   (namespace=<team ns>) → source repos, destinations, and roles (which groups
-   have which permissions).
+1. "What are my apps / are they healthy?": argocd_list_applications (optionally
+   namespace=<ns> or project=<p>) → each app's sync (Synced/OutOfSync), health
+   (Healthy/Degraded/Progressing/Missing), and your capability.
+2. "Why is <app> unhealthy / out of sync?": argocd_get_application (name=<app>;
+   add namespace only if the name is ambiguous) → conditions, last operation, and
+   the per-resource sync/health list; a Degraded resource or a failed sync
+   operation is the lead.
+3. "Which projects can I access / at what level?": argocd_list_projects → each
+   project with capability (admin/sync/view). "Who can access my project / where
+   can it deploy from?": argocd_get_project (name=<project> OR namespace=<ns>) →
+   source repos, destinations, and roles.
+4. "Which namespaces can I access?": argocd_list_namespaces. "May I <action> on
+   <app>?": argocd_can_i (application, action).
 
 Tips:
 - sync=OutOfSync means live state drifted from Git; health=Degraded means the
   workload itself is unhealthy — they are independent, check both.
-- Summaries omit healthy detail; use argocd_get_application for the full picture
-  of one app.`
+- list_* return summaries; use get_application / get_project for full detail.
+- A namespace can be governed by more than one project; argocd_get_project with a
+  namespace returns every project that deploys into it.`

@@ -1,9 +1,9 @@
-// Command argocd-mcp is a read-only ArgoCD MCP server. It exposes a team's
-// ArgoCD Applications and AppProject as summaries for AI agents, keyed by each
-// object's DESTINATION namespace (never the shared argocd namespace) so the
-// calling agent's namespace-scoped authorization filters them per tenant. It
-// never mutates cluster state and never talks to the ArgoCD API — it reads the
-// argoproj.io CRs straight from the Kubernetes API with a read-only
+// Command argocd-mcp is a read-only ArgoCD MCP server. It exposes ArgoCD
+// Applications and AppProjects as summaries for AI agents, scoped to the CALLER:
+// every tool authorizes from the caller's identity (X-Remote-User resolved to
+// OpenShift groups matched against AppProject roles), so it answers "what can *I*
+// access". It never mutates cluster state and never talks to the ArgoCD API — it
+// reads the argoproj.io CRs straight from the Kubernetes API with a read-only
 // ServiceAccount.
 package main
 

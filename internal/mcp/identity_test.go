@@ -37,9 +37,9 @@ func (h headerRT) RoundTrip(r *http.Request) (*http.Response, error) {
 	return h.base.RoundTrip(r)
 }
 
-// callMyProjects connects an SDK client (optionally injecting an identity
-// header) and calls argocd_my_projects, returning the tool's text output.
-func callMyProjects(t *testing.T, url, user string) (string, bool) {
+// callListProjects connects an SDK client (optionally injecting an identity
+// header) and calls argocd_list_projects, returning the tool's text output.
+func callListProjects(t *testing.T, url, user string) (string, bool) {
 	t.Helper()
 	httpClient := &http.Client{Transport: headerRT{user: user, base: http.DefaultTransport}}
 	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "test", Version: "0"}, nil)
@@ -50,7 +50,7 @@ func callMyProjects(t *testing.T, url, user string) (string, bool) {
 	}
 	defer func() { _ = sess.Close() }()
 
-	res, err := sess.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: "argocd_my_projects"})
+	res, err := sess.CallTool(context.Background(), &sdkmcp.CallToolParams{Name: "argocd_list_projects"})
 	if err != nil {
 		t.Fatalf("call tool: %v", err)
 	}
@@ -74,7 +74,7 @@ func TestIdentityPropagation(t *testing.T) {
 	defer ts.Close()
 
 	// With identity: resolver sees the user, output names their project.
-	out, isErr := callMyProjects(t, ts.URL, "alice@example.com")
+	out, isErr := callListProjects(t, ts.URL, "alice@example.com")
 	if isErr {
 		t.Fatalf("with identity: tool errored: %s", out)
 	}
@@ -87,7 +87,7 @@ func TestIdentityPropagation(t *testing.T) {
 
 	// Without identity: the tool refuses (identity comes only from the header).
 	fake.sawUser = ""
-	out, isErr = callMyProjects(t, ts.URL, "")
+	out, isErr = callListProjects(t, ts.URL, "")
 	if !isErr {
 		t.Errorf("without identity: expected an error result, got: %s", out)
 	}

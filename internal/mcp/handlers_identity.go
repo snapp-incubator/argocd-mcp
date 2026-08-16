@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -13,86 +12,122 @@ import (
 	"github.com/snapp-incubator/argocd-mcp/internal/k8s"
 )
 
-// Identity-scoped handlers. Each resolves the CALLER's ArgoCD access from the
-// X-Remote-User identity (set by the trusted bot, read from ctx) and answers
-// without a namespace argument. They never take identity from tool arguments.
+// Identity-scoped handlers. Every tool resolves the CALLER's ArgoCD access from
+// the X-Remote-User identity (set by the trusted bot, read from ctx) and answers
+// "what can *I* access". Identity is never taken from tool arguments; any
+// namespace/project/name argument is only an optional filter or selector.
 
 func errIdentityRequired() error {
 	return fmt.Errorf("identity required: the caller must be identified via the %s header", identityHeader)
 }
 
-func handleMyProjects(r access.Resolver) handlerFunc {
-	return func(ctx context.Context, _ *k8s.Client, _ args) (any, error) {
-		user := userFrom(ctx)
-		if user == "" {
-			return nil, errIdentityRequired()
-		}
-		ua, err := r.AccessFor(ctx, user)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"user": user, "count": len(ua.Projects), "projects": ua.Projects}, nil
+// callerAccess resolves the caller's identity from ctx and their ArgoCD access,
+// refusing when no identity is present. Every handler starts here, so the model
+// can never reach data outside the caller's access.
+func callerAccess(ctx context.Context, r access.Resolver) (string, access.UserAccess, error) {
+	user := userFrom(ctx)
+	if user == "" {
+		return "", access.UserAccess{}, errIdentityRequired()
 	}
+	ua, err := r.AccessFor(ctx, user)
+	return user, ua, err
 }
 
-func handleMyNamespaces(r access.Resolver) handlerFunc {
-	return func(ctx context.Context, _ *k8s.Client, _ args) (any, error) {
-		user := userFrom(ctx)
-		if user == "" {
-			return nil, errIdentityRequired()
-		}
-		ua, err := r.AccessFor(ctx, user)
+// handleListProjects is the lightweight browse: the caller's accessible projects
+// as summaries (project, capability, namespaces, role names). Drill into one
+// with argocd_get_project. Optional namespace narrows to projects governing it.
+func handleListProjects(r access.Resolver) handlerFunc {
+	return func(ctx context.Context, _ *k8s.Client, a args) (any, error) {
+		user, ua, err := callerAccess(ctx, r)
 		if err != nil {
 			return nil, err
 		}
-		ns := ua.Namespaces()
-		return map[string]any{"user": user, "count": len(ns), "namespaces": ns}, nil
-	}
-}
-
-func handleMyApplications(r access.Resolver) handlerFunc {
-	return func(ctx context.Context, c *k8s.Client, _ args) (any, error) {
-		user := userFrom(ctx)
-		if user == "" {
-			return nil, errIdentityRequired()
-		}
-		ua, err := r.AccessFor(ctx, user)
-		if err != nil {
-			return nil, err
-		}
-		list, err := c.Dynamic.Resource(appGVR).List(ctx, metav1.ListOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("list applications: %w", err)
-		}
-		out := make([]map[string]any, 0)
-		for i := range list.Items {
-			item := &list.Items[i]
-			pa, ok := ua.Project(appProject(item))
-			if !ok {
+		nsFilter := a.str("namespace")
+		out := make([]access.ProjectAccess, 0, len(ua.Projects))
+		for _, p := range ua.Projects {
+			if nsFilter != "" && !contains(p.Namespaces, nsFilter) {
 				continue
 			}
-			s := applicationSummary(item)
-			s["capability"] = string(pa.Capability)
-			out = append(out, s)
+			out = append(out, p)
 		}
-		sort.Slice(out, func(i, j int) bool { return name(out[i]) < name(out[j]) })
-		return map[string]any{"user": user, "count": len(out), "applications": out}, nil
+		return map[string]any{"user": user, "count": len(out), "projects": out}, nil
+	}
+}
+
+// handleGetProject is the detail view: full source_repos, destinations, and
+// roles for a project the caller can access. Select by name (one project) OR by
+// namespace (every project whose destinations include it — possibly several).
+func handleGetProject(r access.Resolver) handlerFunc {
+	return func(ctx context.Context, c *k8s.Client, a args) (any, error) {
+		user, ua, err := callerAccess(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		nameSel, nsSel := a.str("name"), a.str("namespace")
+		if nameSel == "" && nsSel == "" {
+			return nil, fmt.Errorf("provide name (a specific project) or namespace (projects governing it)")
+		}
+
+		list, err := c.Dynamic.Resource(projGVR).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list appprojects: %w", err)
+		}
+		out := make([]map[string]any, 0, 1)
+		for i := range list.Items {
+			item := &list.Items[i]
+			if nameSel != "" && item.GetName() != nameSel {
+				continue
+			}
+			// A namespace is governed by every project that lists it as a
+			// destination — collect them all, not just the first.
+			if nsSel != "" && item.GetName() != nsSel && !projectTargetsNamespace(item, nsSel) {
+				continue
+			}
+			pa, ok := ua.Project(item.GetName())
+			if !ok {
+				continue // caller cannot access this project — omit (no leak)
+			}
+			d := projectDetail(item)
+			d["capability"] = string(pa.Capability)
+			out = append(out, d)
+		}
+		return map[string]any{"user": user, "count": len(out), "projects": out}, nil
+	}
+}
+
+// handleListNamespaces lists the destination namespaces the caller can reach.
+// Optional project narrows to that one project's destinations.
+func handleListNamespaces(r access.Resolver) handlerFunc {
+	return func(ctx context.Context, _ *k8s.Client, a args) (any, error) {
+		user, ua, err := callerAccess(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		var ns []string
+		if projSel := a.str("project"); projSel != "" {
+			if pa, ok := ua.Project(projSel); ok {
+				// Reuse UserAccess.Namespaces' dedupe/clean over a single project.
+				ns = access.UserAccess{Projects: []access.ProjectAccess{pa}}.Namespaces()
+			}
+		} else {
+			ns = ua.Namespaces()
+		}
+		if ns == nil {
+			ns = []string{}
+		}
+		return map[string]any{"user": user, "count": len(ns), "namespaces": ns}, nil
 	}
 }
 
 func handleCanI(r access.Resolver) handlerFunc {
 	return func(ctx context.Context, c *k8s.Client, a args) (any, error) {
-		user := userFrom(ctx)
-		if user == "" {
-			return nil, errIdentityRequired()
+		_, ua, err := callerAccess(ctx, r)
+		if err != nil {
+			return nil, err
 		}
 		app, action := a.str("application"), a.str("action")
 		if app == "" || action == "" {
 			return nil, fmt.Errorf("both application and action are required")
-		}
-		ua, err := r.AccessFor(ctx, user)
-		if err != nil {
-			return nil, err
 		}
 
 		// Resolve the application -> its project.

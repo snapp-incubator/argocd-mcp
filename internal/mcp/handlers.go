@@ -10,6 +10,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
+	"github.com/snapp-incubator/argocd-mcp/internal/access"
 	"github.com/snapp-incubator/argocd-mcp/internal/k8s"
 )
 
@@ -36,74 +37,106 @@ func argocdNamespace() string {
 }
 
 // --- tool handlers ---
+//
+// Every handler is a closure over the access.Resolver: authorization is always
+// the CALLER's identity (X-Remote-User -> groups -> AppProject roles), and any
+// namespace/project/name argument is only an OPTIONAL filter or selector,
+// validated against that access. The model is never in the authorization path.
 
-func handleListApplications(ctx context.Context, c *k8s.Client, a args) (any, error) {
-	ns := a.str("namespace")
-	if ns == "" {
-		return nil, fmt.Errorf("namespace is required (your team/destination namespace)")
-	}
-	project := a.str("project")
-
-	list, err := c.Dynamic.Resource(appGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list applications: %w", err)
-	}
-
-	out := make([]map[string]any, 0)
-	for i := range list.Items {
-		item := &list.Items[i]
-		if destinationNamespace(item) != ns {
-			continue
+func handleListApplications(r access.Resolver) handlerFunc {
+	return func(ctx context.Context, c *k8s.Client, a args) (any, error) {
+		user, ua, err := callerAccess(ctx, r)
+		if err != nil {
+			return nil, err
 		}
-		if project != "" && appProject(item) != project {
-			continue
+		nsFilter, projectFilter := a.str("namespace"), a.str("project")
+
+		list, err := c.Dynamic.Resource(appGVR).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list applications: %w", err)
 		}
-		out = append(out, applicationSummary(item))
+
+		out := make([]map[string]any, 0)
+		for i := range list.Items {
+			item := &list.Items[i]
+			pa, ok := ua.Project(appProject(item))
+			if !ok {
+				continue // caller has no access to this app's project
+			}
+			if nsFilter != "" && destinationNamespace(item) != nsFilter {
+				continue
+			}
+			if projectFilter != "" && appProject(item) != projectFilter {
+				continue
+			}
+			s := applicationSummary(item)
+			s["capability"] = string(pa.Capability)
+			out = append(out, s)
+		}
+		sort.Slice(out, func(i, j int) bool { return name(out[i]) < name(out[j]) })
+		return map[string]any{"user": user, "count": len(out), "applications": out}, nil
 	}
-	sort.Slice(out, func(i, j int) bool { return name(out[i]) < name(out[j]) })
-	return map[string]any{"namespace": ns, "count": len(out), "applications": out}, nil
 }
 
-func handleGetApplication(ctx context.Context, c *k8s.Client, a args) (any, error) {
-	ns, appName := a.str("namespace"), a.str("name")
-	if ns == "" || appName == "" {
-		return nil, fmt.Errorf("both namespace and name are required")
-	}
+func handleGetApplication(r access.Resolver) handlerFunc {
+	return func(ctx context.Context, c *k8s.Client, a args) (any, error) {
+		_, ua, err := callerAccess(ctx, r)
+		if err != nil {
+			return nil, err
+		}
+		appName, nsSel := a.str("name"), a.str("namespace")
+		if appName == "" {
+			return nil, fmt.Errorf("name is required")
+		}
 
-	list, err := c.Dynamic.Resource(appGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list applications: %w", err)
-	}
-	for i := range list.Items {
-		item := &list.Items[i]
-		// Match by name AND destination namespace: the caller is authorized for
-		// `ns`, so we only ever return an app that actually targets it — a name
-		// alone can never reach into another tenant's namespace.
-		if item.GetName() == appName && destinationNamespace(item) == ns {
-			return applicationDetail(item), nil
+		list, err := c.Dynamic.Resource(appGVR).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, fmt.Errorf("list applications: %w", err)
+		}
+
+		// Collect the caller-accessible apps matching the name (and namespace, if
+		// given). Apps in projects the caller can't reach are invisible here, so a
+		// name alone can never disclose another tenant's application.
+		var matches []*unstructured.Unstructured
+		for i := range list.Items {
+			item := &list.Items[i]
+			if item.GetName() != appName {
+				continue
+			}
+			if nsSel != "" && destinationNamespace(item) != nsSel {
+				continue
+			}
+			if _, ok := ua.Project(appProject(item)); !ok {
+				continue
+			}
+			matches = append(matches, item)
+		}
+
+		switch len(matches) {
+		case 0:
+			// Do not distinguish "missing" from "inaccessible" — avoids enumeration.
+			return map[string]any{
+				"found":       false,
+				"application": appName,
+				"reason":      "application not found or you do not have access to it",
+			}, nil
+		case 1:
+			item := matches[0]
+			pa, _ := ua.Project(appProject(item))
+			detail := applicationDetail(item)
+			detail["capability"] = string(pa.Capability)
+			return detail, nil
+		default:
+			// Same name across namespaces (apps-in-any-namespace): ask to narrow.
+			nss := make([]string, 0, len(matches))
+			for _, m := range matches {
+				nss = append(nss, destinationNamespace(m))
+			}
+			sort.Strings(nss)
+			return nil, fmt.Errorf("multiple applications named %q found in namespaces %v; pass namespace to disambiguate",
+				appName, nss)
 		}
 	}
-	return nil, fmt.Errorf("application %q deploying into namespace %q not found in %s",
-		appName, ns, argocdNamespace())
-}
-
-func handleGetAppProject(ctx context.Context, c *k8s.Client, a args) (any, error) {
-	ns := a.str("namespace")
-	if ns == "" {
-		return nil, fmt.Errorf("namespace is required (your team/destination namespace)")
-	}
-
-	list, err := c.Dynamic.Resource(projGVR).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("list appprojects: %w", err)
-	}
-	for i := range list.Items {
-		item := &list.Items[i]
-		if item.GetName() == ns || projectTargetsNamespace(item, ns) {
-			return appProjectDetail(item, ns), nil
-		}
-	}
-	return nil, fmt.Errorf("no AppProject governs namespace %q", ns)
 }
 
 // --- summaries (keyed by destination namespace, NEVER the argocd namespace) ---
@@ -192,10 +225,12 @@ func applicationDetail(u *unstructured.Unstructured) map[string]any {
 	return m
 }
 
-func appProjectDetail(u *unstructured.Unstructured, ns string) map[string]any {
+// projectDetail is the full read-only view of one AppProject, keyed by its name
+// (identity mode has no single destination namespace). The caller's capability
+// is attached by the handler.
+func projectDetail(u *unstructured.Unstructured) map[string]any {
 	m := map[string]any{
-		"name":      u.GetName(),
-		"namespace": ns, // scoping key = the tenant namespace asked about
+		"project": u.GetName(),
 	}
 	if repos, ok := nestedStringSlice(u.Object, "spec", "sourceRepos"); ok {
 		m["source_repos"] = repos
@@ -325,6 +360,15 @@ func asString(v any) string {
 }
 
 func name(m map[string]any) string { return asString(m["name"]) }
+
+func contains(ss []string, s string) bool {
+	for _, v := range ss {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
 
 // pruneEmpty drops keys whose value is an empty string, so summaries stay terse.
 func pruneEmpty(m map[string]any) map[string]any {

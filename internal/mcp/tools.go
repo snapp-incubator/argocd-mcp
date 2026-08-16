@@ -16,75 +16,77 @@ func str(desc string) map[string]any {
 	return map[string]any{"type": "string", "description": desc}
 }
 
-// nsDesc documents the tenant-scoping argument shared by every tool. It is the
-// destination namespace (the team's own namespace), never "user-argocd".
-const nsDesc = "The team / destination namespace: the namespace Applications deploy into " +
-	"(spec.destination.namespace), which equals the team's own namespace and its " +
+// nsMeaning documents what a "namespace" is across the tools: the destination
+// namespace (the team's own namespace), never "user-argocd" where the CRs live.
+const nsMeaning = "the destination namespace Applications deploy into " +
+	"(spec.destination.namespace) — the team's own namespace, which usually equals its " +
 	"AppProject name. NOT the shared 'user-argocd' namespace where the CRs live."
 
+// buildTools returns the tool set. Every tool is IDENTITY-scoped: it authorizes
+// from the caller's X-Remote-User identity (resolved to OpenShift groups matched
+// against AppProject roles) and answers "what can *I* access". Any
+// namespace/project/name argument is only an optional filter or selector,
+// validated against that access — never the authorization mechanism.
 func buildTools(r access.Resolver) []tool {
 	return []tool{
 		{
 			name: "argocd_list_applications",
-			description: "List ArgoCD Applications that deploy into a namespace, with project, " +
-				"sync status, health, and source (repo/path/revision). Start here for " +
-				"\"what are my apps\" or \"are my deployments healthy\".",
+			description: "List the CALLER's ArgoCD Applications (across every project they can access), " +
+				"each with project, destination namespace, sync status, health, source, and the " +
+				"caller's capability. Start here for \"what are my apps / are they healthy?\". " +
+				"Optional filters narrow the list.",
 			schema: objSchema(map[string]any{
-				"namespace": str(nsDesc),
-				"project":   str("Optional: only Applications in this AppProject."),
-			}, "namespace"),
-			handler: handleListApplications,
+				"namespace": str("Optional filter: only apps deploying into this namespace (" + nsMeaning + ")."),
+				"project":   str("Optional filter: only apps in this AppProject."),
+			}),
+			handler: handleListApplications(r),
 		},
 		{
 			name: "argocd_get_application",
-			description: "Full read-only view of one ArgoCD Application deploying into the given " +
-				"namespace: sync/health, source, sync-policy, conditions, the last sync " +
-				"operation, and the per-resource sync/health list. Use to diagnose an app " +
-				"that is OutOfSync or Degraded.",
+			description: "Full read-only view of ONE of the caller's Applications: sync/health, source, " +
+				"conditions, the last sync operation, and the per-resource sync/health list. Use to " +
+				"diagnose an app that is OutOfSync or Degraded. Returns not-found if the caller has no " +
+				"access to it.",
 			schema: objSchema(map[string]any{
-				"namespace": str(nsDesc),
-				"name":      str("Application name."),
-			}, "namespace", "name"),
-			handler: handleGetApplication,
+				"name": str("Application name."),
+				"namespace": str("Optional: the destination namespace, to DISAMBIGUATE apps that share a name " +
+					"across namespaces (" + nsMeaning + "). Omit when the name is unique."),
+			}, "name"),
+			handler: handleGetApplication(r),
 		},
 		{
-			name: "argocd_get_appproject",
-			description: "Describe the AppProject governing a namespace: allowed source repos, " +
-				"destinations, and roles (which groups hold which permissions). Answers " +
-				"\"who can access my project\" and \"where can it deploy from\".",
+			name: "argocd_list_projects",
+			description: "List the projects the CALLER can access as summaries: project, capability " +
+				"(admin / sync / view), destination namespaces, and role names. Answers \"which projects " +
+				"can I manage/admin/view?\". Optional namespace narrows to projects governing it; drill " +
+				"into one with argocd_get_project.",
 			schema: objSchema(map[string]any{
-				"namespace": str(nsDesc),
-			}, "namespace"),
-			handler: handleGetAppProject,
-		},
-
-		// --- Identity-scoped tools (no namespace argument) ---
-		// These answer "what can *I* access" from the caller's identity (the
-		// X-Remote-User header set by the bot). They resolve the caller's groups
-		// and match them against AppProject roles, so they honor ArgoCD's own
-		// group RBAC. The bot marks them self-authorized (returned unfiltered).
-		{
-			name: "argocd_my_projects",
-			description: "List every AppProject the CALLER can access, each with their capability " +
-				"(admin / sync / view), destination namespaces, and the roles that grant it. " +
-				"Answers \"which projects can I manage/admin/view?\". Needs no namespace argument.",
-			schema:  objSchema(map[string]any{}),
-			handler: handleMyProjects(r),
+				"namespace": str("Optional filter: only projects that deploy into this namespace (" + nsMeaning + ")."),
+			}),
+			handler: handleListProjects(r),
 		},
 		{
-			name: "argocd_my_applications",
-			description: "List every Application across all projects the CALLER can access, with " +
-				"project, destination namespace, sync, health, and the caller's capability on it. " +
-				"Answers \"list all my apps / which of my apps are unhealthy?\". No namespace argument.",
-			schema:  objSchema(map[string]any{}),
-			handler: handleMyApplications(r),
+			name: "argocd_get_project",
+			description: "Full detail of a project the CALLER can access: allowed source repos, " +
+				"destinations, roles (which groups hold which permissions), and the caller's capability. " +
+				"Select by name (one project) OR by namespace (EVERY project whose destinations include it " +
+				"— a namespace may be governed by more than one). Answers \"who can access my project\" " +
+				"and \"where can it deploy from\". Provide name or namespace.",
+			schema: objSchema(map[string]any{
+				"name":      str("The AppProject name. Provide this OR namespace."),
+				"namespace": str("A destination namespace (" + nsMeaning + "); returns every accessible project that deploys into it. Provide this OR name."),
+			}),
+			handler: handleGetProject(r),
 		},
 		{
-			name: "argocd_my_namespaces",
-			description: "List the destination namespaces the CALLER's accessible projects deploy " +
-				"into. Answers \"which namespaces can I access in ArgoCD?\". No namespace argument.",
-			schema:  objSchema(map[string]any{}),
-			handler: handleMyNamespaces(r),
+			name: "argocd_list_namespaces",
+			description: "List the destination namespaces the CALLER's accessible projects deploy into. " +
+				"Answers \"which namespaces can I access in ArgoCD?\". Optional project narrows to that " +
+				"one project's destinations.",
+			schema: objSchema(map[string]any{
+				"project": str("Optional filter: only the destination namespaces of this AppProject."),
+			}),
+			handler: handleListNamespaces(r),
 		},
 		{
 			name: "argocd_can_i",
