@@ -157,4 +157,4 @@ Tests cover: group-object parsing and implicit-group merge (`internal/groups`); 
 
 ## Deployment
 
-Deployed per cluster via the `argocd-mcp` Helm chart in the platform infra repo, behind the private Contour ingress with basic auth; [the SnappCloud Bot](https://github.com/snapp-incubator/snappcloud-bot/) is the only client, configured to forward identity (`sendIdentity`) and treat the tools as `selfAuthorized`.
+Deployed per cluster via the `argocd-mcp` Helm chart in the platform infra repo, behind the private Contour ingress with basic auth; [the SnappCloud Bot](https://github.com/snapp-incubator/snappcloud-bot/) is the only client, configured to forward identity and treat the tools as `selfAuthorized`.
